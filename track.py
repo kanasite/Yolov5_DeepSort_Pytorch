@@ -234,6 +234,7 @@ def detect(opt, save_img=False):
                                     thread.start()
                                     email_last_sent_at = time.time()
                                 tt = None
+                            draw_alert_boxes(im0, n)
                         draw_boxes(im0, bbox_xyxy, identities)
 
                     # Write MOT compliant results to file
