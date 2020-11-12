@@ -2,7 +2,7 @@ import sys
 sys.path.insert(0, './deep_sort_pytorch')
 sys.path.insert(0, './yolov5')
 
-
+import threading
 from yolov5.utils.datasets import LoadImages, LoadStreams
 from yolov5.utils.general import (
     check_img_size, non_max_suppression, apply_classifier, scale_coords, xyxy2xywh, plot_one_box, strip_optimizer)
@@ -45,7 +45,6 @@ def bbox_rel(image_width, image_height,  *xyxy):
     h = bbox_h
     return x_c, y_c, w, h
 
-
 def compute_color_for_labels(label):
     """
     Simple function that adds fixed color depending on the class
@@ -57,6 +56,33 @@ def timestamp_watermark(img):
     cv2.rectangle(img, (0, 0), (300, 30), (0, 0, 0), -1)
     cv2.putText(img, time.ctime(time.time()), (20, 20), cv2.FONT_HERSHEY_PLAIN, 1, (255, 255, 255), 1)
     return img
+
+def draw_alert_boxes(img, n):
+    cv2.rectangle(img, (0, 0), (1000, 100), (0, 0, 0), -1)
+    cv2.putText(img, '{:d} dogs detected!'.format(n), (50, 50), cv2.FONT_HERSHEY_PLAIN, 3, (255, 255, 255), 1)
+    return img
+
+def send_email(n, names, c, tt):
+    sp.transmissions.send(
+        recipients=email_recipients,
+        html="<p>{} {}s detected at {} ({} secs lapsed)</p><p>Email will be sent at most every {} mins.</p>".format(n, names[int(c)], time.ctime(tt), lapsed, notification_once_at_most / 60),
+        from_email=from_email,
+        subject='Object Detected!',
+        attachments=[
+            {
+                "name": "start.jpg",
+                "type": "image/jpg",
+                "filename": attachment_base_path + '/start.jpg'
+            },
+            {
+                "name": "end.jpg",
+                "type": "image/jpg",
+                "filename": attachment_base_path + '/end.jpg'
+            },
+        ],
+        track_opens=True,
+        track_clicks=True
+    )
 
 def draw_boxes(img, bbox, identities=None, offset=(0,0)):
     for i, box in enumerate(bbox):
@@ -204,26 +230,8 @@ def detect(opt, save_img=False):
                                     attachment_path = attachment_base_path + '/end.jpg'
                                     # timestamp_watermark(im0)
                                     cv2.imwrite(attachment_path, im0)
-                                    sp.transmissions.send(
-                                        recipients=email_recipients,
-                                        html="<p>{} {}s detected at {} ({} secs lapsed)</p><p>Email will be sent at most every {} mins.</p>".format(n, names[int(c)], time.ctime(tt), lapsed, notification_once_at_most / 60),
-                                        from_email=from_email,
-                                        subject='Object Detected!',
-                                        attachments=[
-                                            {
-                                                "name": "start.jpg",
-                                                "type": "image/jpg",
-                                                "filename": attachment_base_path + '/start.jpg'
-                                            },
-                                            {
-                                                "name": "end.jpg",
-                                                "type": "image/jpg",
-                                                "filename": attachment_base_path + '/end.jpg'
-                                            },
-                                        ],
-                                        track_opens=True,
-                                        track_clicks=True
-                                    )
+                                    thread = threading.Thread(target=send_email, args=(n, names, c, tt))
+                                    thread.start()
                                     email_last_sent_at = time.time()
                                 tt = None
                         draw_boxes(im0, bbox_xyxy, identities)
@@ -283,7 +291,7 @@ if __name__ == '__main__':
     parser.add_argument('--source', type=str, default='inference/images', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--output', type=str, default='inference/output', help='output folder')  # output folder
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.4, help='object confidence threshold')
+    parser.add_argument('--conf-thres', type=float, default=0.6, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
