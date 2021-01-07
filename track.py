@@ -1,11 +1,13 @@
 import sys
 sys.path.insert(0, './yolov5')
 
+import threading
 from yolov5.utils.datasets import LoadImages, LoadStreams
 from yolov5.utils.general import check_img_size, non_max_suppression, scale_coords
 from yolov5.utils.torch_utils import select_device, time_synchronized
 from deep_sort_pytorch.utils.parser import get_config
 from deep_sort_pytorch.deep_sort import DeepSort
+from sparkpost import SparkPost
 import argparse
 import os
 import platform
@@ -16,10 +18,50 @@ import cv2
 import torch
 import torch.backends.cudnn as cudnn
 
-
+sp = SparkPost('5cc4fc5b96e7f43e65c470b033421e6632acac27')
+cv2.namedWindow("output", cv2.WINDOW_NORMAL)
 
 palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
 
+filter_class = 16 # dog is class 16 in cocodatasets
+lapsed = 5 # how many secs before 
+object_trigger_count = 2 # min how many object to trigger email
+notification_once_at_most = 15 * 60 # at most send 1 email every X secs
+from_email = 'python@3comma.my' # from email must match with sending domains in sparkpost
+email_recipients = ['shauleong@gmail.com'] # email to receive alert
+attachment_base_path = str(Path('attachments'))
+
+def timestamp_watermark(img):
+    cv2.rectangle(img, (0, 0), (300, 30), (0, 0, 0), -1)
+    cv2.putText(img, time.ctime(time.time()), (20, 20), cv2.FONT_HERSHEY_PLAIN, 1, (255, 255, 255), 1)
+    return img
+
+def draw_alert_boxes(img, n):
+    cv2.rectangle(img, (0, 0), (1000, 100), (0, 0, 0), -1)
+    cv2.putText(img, '{:d} dogs detected!'.format(n), (50, 50), cv2.FONT_HERSHEY_PLAIN, 3, (255, 255, 255), 1)
+    return img
+
+def send_email(n, names, c, tt):
+    sp.transmissions.send(
+        recipients=email_recipients,
+        html="<p>{} {}s detected at {} ({} secs lapsed)</p><p>Email will be sent at most every {} mins.</p>".format(n, names[int(c)], time.ctime(tt), lapsed, notification_once_at_most / 60),
+        from_email=from_email,
+        subject='Object Detected!',
+        attachments=[
+            {
+                "name": "start.jpg",
+                "type": "image/jpg",
+                "filename": attachment_base_path + '/start.jpg'
+            },
+            {
+                "name": "end.jpg",
+                "type": "image/jpg",
+                "filename": attachment_base_path + '/end.jpg'
+            },
+        ],
+        track_opens=True,
+        track_clicks=True
+    )
 
 def bbox_rel(*xyxy):
     """" Calculates the relative bounding box from absolute pixel values. """
@@ -94,12 +136,12 @@ def detect(opt, save_img=False):
     # Set Dataloader
     vid_path, vid_writer = None, None
     if webcam:
-        view_img = True
+        # view_img = True
         cudnn.benchmark = True  # set True to speed up constant image size inference
         dataset = LoadStreams(source, img_size=imgsz)
     else:
-        view_img = True
-        save_img = True
+        # view_img = True
+        # save_img = True
         dataset = LoadImages(source, img_size=imgsz)
 
     # Get names and colors
@@ -107,6 +149,8 @@ def detect(opt, save_img=False):
 
     # Run inference
     t0 = time.time()
+    tt = None
+    email_last_sent_at = 0
     img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
     # run once
     _ = model(img.half() if half else img) if device.type != 'cpu' else None
@@ -114,106 +158,136 @@ def detect(opt, save_img=False):
     save_path = str(Path(out))
     txt_path = str(Path(out)) + '/results.txt'
 
-    for frame_idx, (path, img, im0s, vid_cap) in enumerate(dataset):
-        img = torch.from_numpy(img).to(device)
-        img = img.half() if half else img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
-        if img.ndimension() == 3:
-            img = img.unsqueeze(0)
+    loop = True
+    while (loop):
+        if (dataset is None):
+            dataset = LoadStreams(source, img_size=imgsz)
+        for frame_idx, (path, img, im0s, vid_cap) in enumerate(dataset):
+            if (img is None):
+                dataset = None
+                break
 
-        # Inference
-        t1 = time_synchronized()
-        pred = model(img, augment=opt.augment)[0]
+            img = torch.from_numpy(img).to(device)
+            img = img.half() if half else img.float()  # uint8 to fp16/32
+            img /= 255.0  # 0 - 255 to 0.0 - 1.0
+            if img.ndimension() == 3:
+                img = img.unsqueeze(0)
 
-        # Apply NMS
-        pred = non_max_suppression(
-            pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
-        t2 = time_synchronized()
+            # Inference
+            t1 = time_synchronized()
+            pred = model(img, augment=opt.augment)[0]
 
-        # Process detections
-        for i, det in enumerate(pred):  # detections per image
-            if webcam:  # batch_size >= 1
-                p, s, im0 = path[i], '%g: ' % i, im0s[i].copy()
-            else:
-                p, s, im0 = path, '', im0s
+            # Apply NMS
+            pred = non_max_suppression(
+                pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
+            t2 = time_synchronized()
 
-            s += '%gx%g ' % img.shape[2:]  # print string
-            save_path = str(Path(out) / Path(p).name)
-
-            if det is not None and len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(
-                    img.shape[2:], det[:, :4], im0.shape).round()
-
-                # Print results
-                for c in det[:, -1].unique():
-                    n = (det[:, -1] == c).sum()  # detections per class
-                    s += '%g %ss, ' % (n, names[int(c)])  # add to string
-
-                bbox_xywh = []
-                confs = []
-
-                # Adapt detections to deep sort input format
-                for *xyxy, conf, cls in det:
-                    x_c, y_c, bbox_w, bbox_h = bbox_rel(*xyxy)
-                    obj = [x_c, y_c, bbox_w, bbox_h]
-                    bbox_xywh.append(obj)
-                    confs.append([conf.item()])
-
-                xywhs = torch.Tensor(bbox_xywh)
-                confss = torch.Tensor(confs)
-
-                # Pass detections to deepsort
-                outputs = deepsort.update(xywhs, confss, im0)
-
-                # draw boxes for visualization
-                if len(outputs) > 0:
-                    bbox_xyxy = outputs[:, :4]
-                    identities = outputs[:, -1]
-                    draw_boxes(im0, bbox_xyxy, identities)
-
-                # Write MOT compliant results to file
-                if save_txt and len(outputs) != 0:
-                    for j, output in enumerate(outputs):
-                        bbox_left = output[0]
-                        bbox_top = output[1]
-                        bbox_w = output[2]
-                        bbox_h = output[3]
-                        identity = output[-1]
-                        with open(txt_path, 'a') as f:
-                            f.write(('%g ' * 10 + '\n') % (frame_idx, identity, bbox_left,
-                                                           bbox_top, bbox_w, bbox_h, -1, -1, -1, -1))  # label format
-
-            else:
-                deepsort.increment_ages()
-
-            # Print time (inference + NMS)
-            print('%sDone. (%.3fs)' % (s, t2 - t1))
-
-            # Stream results
-            if view_img:
-                cv2.imshow(p, im0)
-                if cv2.waitKey(1) == ord('q'):  # q to quit
-                    raise StopIteration
-
-            # Save results (image with detections)
-            if save_img:
-                print('saving img!')
-                if dataset.mode == 'images':
-                    cv2.imwrite(save_path, im0)
+            # Process detections
+            for i, det in enumerate(pred):  # detections per image
+                if webcam:  # batch_size >= 1
+                    p, s, im0 = path[i], '%g: ' % i, im0s[i].copy()
                 else:
-                    print('saving video!')
-                    if vid_path != save_path:  # new video
-                        vid_path = save_path
-                        if isinstance(vid_writer, cv2.VideoWriter):
-                            vid_writer.release()  # release previous video writer
+                    p, s, im0 = path, '', im0s
 
-                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        vid_writer = cv2.VideoWriter(
-                            save_path, cv2.VideoWriter_fourcc(*opt.fourcc), fps, (w, h))
-                    vid_writer.write(im0)
+                s += '%gx%g ' % img.shape[2:]  # print string
+                save_path = str(Path(out) / Path(p).name)
+
+                if det is not None and len(det):
+                    # Rescale boxes from img_size to im0 size
+                    det[:, :4] = scale_coords(
+                        img.shape[2:], det[:, :4], im0.shape).round()
+
+                    # Print results
+                    for c in det[:, -1].unique():
+                        n = (det[:, -1] == c).sum()  # detections per class
+                        s += '%g %ss, ' % (n, names[int(c)])  # add to string
+
+                    bbox_xywh = []
+                    confs = []
+
+                    # Adapt detections to deep sort input format
+                    for *xyxy, conf, cls in det:
+                        x_c, y_c, bbox_w, bbox_h = bbox_rel(*xyxy)
+                        obj = [x_c, y_c, bbox_w, bbox_h]
+                        bbox_xywh.append(obj)
+                        confs.append([conf.item()])
+
+                    xywhs = torch.Tensor(bbox_xywh)
+                    confss = torch.Tensor(confs)
+
+                    # Pass detections to deepsort
+                    outputs = deepsort.update(xywhs, confss, im0)
+
+                    # draw boxes for visualization
+                    if len(outputs) > 0:
+                        bbox_xyxy = outputs[:, :4]
+                        identities = outputs[:, -1]
+                        if (n >= object_trigger_count):
+                            if (type(tt) == type(None)):
+                                tt = time.time()
+                                print('timer started at %s' % (tt))
+                                attachment_path = attachment_base_path + '/start.jpg'
+                                # timestamp_watermark(im0)
+                                cv2.imwrite(attachment_path, im0)
+                            elif (time.time() - tt >= lapsed):
+                                if (time.time() - notification_once_at_most >= email_last_sent_at):
+                                    print('trigger at %s' % (time.time()))
+                                    attachment_path = attachment_base_path + '/end.jpg'
+                                    # timestamp_watermark(im0)
+                                    cv2.imwrite(attachment_path, im0)
+                                    thread = threading.Thread(target=send_email, args=(n, names, c, tt))
+                                    thread.start()
+                                    email_last_sent_at = time.time()
+                                tt = None
+                            draw_alert_boxes(im0, n)
+                        draw_boxes(im0, bbox_xyxy, identities)
+
+                    # Write MOT compliant results to file
+                    if save_txt and len(outputs) != 0:
+                        for j, output in enumerate(outputs):
+                            bbox_left = output[0]
+                            bbox_top = output[1]
+                            bbox_w = output[2]
+                            bbox_h = output[3]
+                            identity = output[-1]
+                            with open(txt_path, 'a') as f:
+                                f.write(('%g ' * 10 + '\n') % (frame_idx, identity, bbox_left,
+                                                            bbox_top, bbox_w, bbox_h, -1, -1, -1, -1))  # label format
+
+                else:
+                    deepsort.increment_ages()
+
+                # Print time (inference + NMS)
+                print('%sDone. (%.3fs)' % (s, t2 - t1))
+
+                # Stream results
+                if view_img:
+                    cv2.imshow(p, im0)
+                    if cv2.waitKey(1) == ord('q'):  # q to quit
+                        raise StopIteration
+
+                # Save results (image with detections)
+                if save_img:
+                    print('saving img!')
+                    if dataset.mode == 'images':
+                        cv2.imwrite(save_path, im0)
+                    else:
+                        print('saving video!')
+                        if vid_path != save_path:  # new video
+                            vid_path = save_path
+                            if isinstance(vid_writer, cv2.VideoWriter):
+                                vid_writer.release()  # release previous video writer
+
+                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                            w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                            vid_writer = cv2.VideoWriter(
+                                save_path, cv2.VideoWriter_fourcc(*opt.fourcc), fps, (w, h))
+                        vid_writer.write(im0)
+
+            if (type(tt) != type(None) and (time.time() - tt >= lapsed)):
+                print('clear timer')
+                tt = None                        
 
     if save_txt or save_img:
         print('Results saved to %s' % os.getcwd() + os.sep + out)
@@ -226,7 +300,7 @@ def detect(opt, save_img=False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str,
-                        default='yolov5/weights/yolov5s.pt', help='model.pt path')
+                        default='yolov5/weights/yolov5x.pt', help='model.pt path')
     # file/folder, 0 for webcam
     parser.add_argument('--source', type=str,
                         default='inference/images', help='source')
@@ -235,7 +309,7 @@ if __name__ == '__main__':
     parser.add_argument('--img-size', type=int, default=640,
                         help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float,
-                        default=0.4, help='object confidence threshold')
+                        default=0.6, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float,
                         default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--fourcc', type=str, default='mp4v',
@@ -248,7 +322,7 @@ if __name__ == '__main__':
                         help='save results to *.txt')
     # class 0 is person
     parser.add_argument('--classes', nargs='+', type=int,
-                        default=[0], help='filter by class')
+                        default=[filter_class], help='filter by class')
     parser.add_argument('--agnostic-nms', action='store_true',
                         help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true',
